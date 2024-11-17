@@ -1,0 +1,182 @@
+from flask import Flask, request
+from flask_socketio import SocketIO, join_room, leave_room, emit
+from collections import defaultdict
+import json
+import uuid
+import requests
+from datetime import datetime
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key'  # Replace with actual secret key
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# In-memory storage for session data
+sessions = {}
+# Structure: {
+#     'session_id': {
+#         'participants': {
+#             'user_id': {
+#                 'likes': set(),
+#                 'socket_id': 'socket_id'
+#             }
+#         },
+#         'restaurants': [],
+#         'location': {'lat': float, 'lon': float},
+#         'matches': set()
+#     }
+# }
+
+def fetch_restaurants(lat, lon):
+    """Fetch restaurants from Wolt API"""
+    try:
+        response = requests.get(
+            f'https://wolt-restaurant-api.herokuapp.com/discovery',
+            params={'lat': lat, 'lon': lon}
+        )
+        return response.json()
+    except Exception as e:
+        print(f"Error fetching restaurants: {e}")
+        return []
+
+def check_for_match(session_id, restaurant_id):
+    """Check if all participants liked the same restaurant"""
+    if session_id not in sessions:
+        return False
+    
+    session = sessions[session_id]
+    participants = session['participants']
+    
+    # If everyone has liked this restaurant
+    return all(
+        restaurant_id in participant['likes']
+        for participant in participants.values()
+    )
+
+@socketio.on('connect')
+def handle_connect():
+    print(f"Client connected: {request.sid}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"Client disconnected: {request.sid}")
+    # Clean up user from all sessions they're in
+    for session in sessions.values():
+        for user_id, user_data in list(session['participants'].items()):
+            if user_data['socket_id'] == request.sid:
+                del session['participants'][user_id]
+                # If session is empty, remove it
+                if not session['participants']:
+                    del sessions[session['session_id']]
+                break
+
+@socketio.on('create_session')
+def handle_create_session(data):
+    """Handle new session creation"""
+    session_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    
+    # Fetch restaurants for the session
+    restaurants = fetch_restaurants(data['location']['lat'], data['location']['lon'])
+    
+    # Create new session
+    sessions[session_id] = {
+        'participants': {
+            user_id: {
+                'likes': set(),
+                'socket_id': request.sid
+            }
+        },
+        'restaurants': restaurants,
+        'location': data['location'],
+        'matches': set()
+    }
+    
+    # Join socket room
+    join_room(session_id)
+    
+    # Send session details back to creator
+    emit('session_created', {
+        'session_id': session_id,
+        'user_id': user_id,
+        'restaurants': restaurants
+    })
+
+@socketio.on('join_session')
+def handle_join_session(data):
+    """Handle joining existing session"""
+    session_id = data['session_id']
+    
+    if session_id not in sessions:
+        emit('error', {'message': 'Session not found'})
+        return
+    
+    user_id = str(uuid.uuid4())
+    
+    # Add user to session
+    sessions[session_id]['participants'][user_id] = {
+        'likes': set(),
+        'socket_id': request.sid
+    }
+    
+    # Join socket room
+    join_room(session_id)
+    
+    # Send current session state to new participant
+    emit('session_joined', {
+        'user_id': user_id,
+        'restaurants': sessions[session_id]['restaurants'],
+        'participant_count': len(sessions[session_id]['participants'])
+    })
+    
+    # Notify other participants
+    emit('participant_joined', {
+        'participant_count': len(sessions[session_id]['participants'])
+    }, room=session_id)
+
+@socketio.on('like_restaurant')
+def handle_like_restaurant(data):
+    """Handle restaurant like"""
+    session_id = data['session_id']
+    user_id = data['user_id']
+    restaurant_id = data['restaurant_id']
+    
+    if session_id not in sessions:
+        emit('error', {'message': 'Session not found'})
+        return
+    
+    # Add like to user's likes
+    sessions[session_id]['participants'][user_id]['likes'].add(restaurant_id)
+    
+    # Check for match
+    if check_for_match(session_id, restaurant_id):
+        # Find restaurant details
+        restaurant = next(
+            (r for r in sessions[session_id]['restaurants'] if r['id'] == restaurant_id),
+            None
+        )
+        
+        if restaurant:
+            # Notify all participants of match
+            emit('match_found', {
+                'restaurant': restaurant
+            }, room=session_id)
+            
+            # Add to session matches
+            sessions[session_id]['matches'].add(restaurant_id)
+
+@socketio.on('get_session_state')
+def handle_get_session_state(data):
+    """Handle request for current session state"""
+    session_id = data['session_id']
+    
+    if session_id not in sessions:
+        emit('error', {'message': 'Session not found'})
+        return
+    
+    emit('session_state', {
+        'participant_count': len(sessions[session_id]['participants']),
+        'matches': list(sessions[session_id]['matches'])
+    })
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True)
